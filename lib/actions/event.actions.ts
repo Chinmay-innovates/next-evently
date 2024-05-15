@@ -1,165 +1,203 @@
 "use server";
 
-// import Stripe from 'stripe';
+import { revalidatePath } from "next/cache";
+
+import { connectToDatabase } from "@/lib/database";
+import Event from "@/lib/database/models/event.model";
+import User from "@/lib/database/models/user.model";
+import Category from "@/lib/database/models/category.model";
+import { handleError } from "@/lib/utils";
+
 import {
-  CheckoutOrderParams,
-  CreateOrderParams,
-  GetOrdersByEventParams,
-  GetOrdersByUserParams,
+  CreateEventParams,
+  UpdateEventParams,
+  DeleteEventParams,
+  GetAllEventsParams,
+  GetEventsByUserParams,
+  GetRelatedEventsByCategoryParams,
 } from "@/types";
-import { redirect } from "next/navigation";
-import { handleError } from "../utils";
-import { connectToDatabase } from "../database";
-import Order from "../database/models/order.model";
-import Event from "../database/models/event.model";
-import { ObjectId } from "mongodb";
-import User from "../database/models/user.model";
 
-export const checkoutOrder = async (order: CheckoutOrderParams) => {
-  //   const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!);
-
-  const price = order.isFree ? 0 : Number(order.price) * 100;
-
-  try {
-    // const session = await stripe.checkout.sessions.create({
-    //   line_items: [
-    //     {
-    //       price_data: {
-    //         currency: 'usd',
-    //         unit_amount: price,
-    //         product_data: {
-    //           name: order.eventTitle
-    //         }
-    //       },
-    //       quantity: 1
-    //     },
-    //   ],
-    //   metadata: {
-    //     eventId: order.eventId,
-    //     buyerId: order.buyerId,
-    //   },
-    //   mode: 'payment',
-    //   success_url: `${process.env.NEXT_PUBLIC_SERVER_URL}/profile`,
-    //   cancel_url: `${process.env.NEXT_PUBLIC_SERVER_URL}/`,
-    // });
-    // redirect(session.url!)
-  } catch (error) {
-    throw error;
-  }
+const getCategoryByName = async (name: string) => {
+  return Category.findOne({ name: { $regex: name, $options: "i" } });
 };
 
-export const createOrder = async (order: CreateOrderParams) => {
+const populateEvent = (query: any) => {
+  return query
+    .populate({
+      path: "organizer",
+      model: User,
+      select: "_id firstName lastName",
+    })
+    .populate({ path: "category", model: Category, select: "_id name" });
+};
+
+// CREATE
+export async function createEvent({ userId, event, path }: CreateEventParams) {
   try {
     await connectToDatabase();
 
-    const newOrder = await Order.create({
-      ...order,
-      event: order.eventId,
-      buyer: order.buyerId,
+    const organizer = await User.findById(userId);
+    if (!organizer) throw new Error("Organizer not found");
+
+    const newEvent = await Event.create({
+      ...event,
+      category: event.categoryId,
+      organizer: userId,
     });
+    revalidatePath(path);
 
-    return JSON.parse(JSON.stringify(newOrder));
-  } catch (error) {
-    handleError(error);
-  }
-};
-
-// GET ORDERS BY EVENT
-export async function getOrdersByEvent({
-  searchString,
-  eventId,
-}: GetOrdersByEventParams) {
-  try {
-    await connectToDatabase();
-
-    if (!eventId) throw new Error("Event ID is required");
-    const eventObjectId = new ObjectId(eventId);
-
-    const orders = await Order.aggregate([
-      {
-        $lookup: {
-          from: "users",
-          localField: "buyer",
-          foreignField: "_id",
-          as: "buyer",
-        },
-      },
-      {
-        $unwind: "$buyer",
-      },
-      {
-        $lookup: {
-          from: "events",
-          localField: "event",
-          foreignField: "_id",
-          as: "event",
-        },
-      },
-      {
-        $unwind: "$event",
-      },
-      {
-        $project: {
-          _id: 1,
-          totalAmount: 1,
-          createdAt: 1,
-          eventTitle: "$event.title",
-          eventId: "$event._id",
-          buyer: {
-            $concat: ["$buyer.firstName", " ", "$buyer.lastName"],
-          },
-        },
-      },
-      {
-        $match: {
-          $and: [
-            { eventId: eventObjectId },
-            { buyer: { $regex: RegExp(searchString, "i") } },
-          ],
-        },
-      },
-    ]);
-
-    return JSON.parse(JSON.stringify(orders));
+    return JSON.parse(JSON.stringify(newEvent));
   } catch (error) {
     handleError(error);
   }
 }
 
-// GET ORDERS BY USER
-export async function getOrdersByUser({
-  userId,
-  limit = 3,
+// GET ONE EVENT BY ID
+export async function getEventById(eventId: string) {
+  try {
+    await connectToDatabase();
+
+    const event = await populateEvent(Event.findById(eventId));
+
+    if (!event) throw new Error("Event not found");
+
+    return JSON.parse(JSON.stringify(event));
+  } catch (error) {
+    handleError(error);
+  }
+}
+
+// UPDATE
+export async function updateEvent({ userId, event, path }: UpdateEventParams) {
+  try {
+    await connectToDatabase();
+
+    const eventToUpdate = await Event.findById(event._id);
+    if (!eventToUpdate || eventToUpdate.organizer.toHexString() !== userId) {
+      throw new Error("Unauthorized or event not found");
+    }
+
+    const updatedEvent = await Event.findByIdAndUpdate(
+      event._id,
+      { ...event, category: event.categoryId },
+      { new: true }
+    );
+    revalidatePath(path);
+
+    return JSON.parse(JSON.stringify(updatedEvent));
+  } catch (error) {
+    handleError(error);
+  }
+}
+
+// DELETE
+export async function deleteEvent({ eventId, path }: DeleteEventParams) {
+  try {
+    await connectToDatabase();
+
+    const deletedEvent = await Event.findByIdAndDelete(eventId);
+    if (deletedEvent) revalidatePath(path);
+  } catch (error) {
+    handleError(error);
+  }
+}
+
+// GET ALL EVENTS
+export async function getAllEvents({
+  query,
+  limit = 6,
   page,
-}: GetOrdersByUserParams) {
+  category,
+}: GetAllEventsParams) {
+  try {
+    await connectToDatabase();
+
+    const titleCondition = query
+      ? { title: { $regex: query, $options: "i" } }
+      : {};
+    const categoryCondition = category
+      ? await getCategoryByName(category)
+      : null;
+    const conditions = {
+      $and: [
+        titleCondition,
+        categoryCondition ? { category: categoryCondition._id } : {},
+      ],
+    };
+
+    const skipAmount = (Number(page) - 1) * limit;
+    const eventsQuery = Event.find(conditions)
+      .sort({ createdAt: "desc" })
+      .skip(skipAmount)
+      .limit(limit);
+
+    const events = await populateEvent(eventsQuery);
+    const eventsCount = await Event.countDocuments(conditions);
+
+    return {
+      data: JSON.parse(JSON.stringify(events)),
+      totalPages: Math.ceil(eventsCount / limit),
+    };
+  } catch (error) {
+    handleError(error);
+  }
+}
+
+// GET EVENTS BY ORGANIZER
+export async function getEventsByUser({
+  userId,
+  limit = 6,
+  page,
+}: GetEventsByUserParams) {
+  try {
+    await connectToDatabase();
+
+    const conditions = { organizer: userId };
+    const skipAmount = (page - 1) * limit;
+
+    const eventsQuery = Event.find(conditions)
+      .sort({ createdAt: "desc" })
+      .skip(skipAmount)
+      .limit(limit);
+
+    const events = await populateEvent(eventsQuery);
+    const eventsCount = await Event.countDocuments(conditions);
+
+    return {
+      data: JSON.parse(JSON.stringify(events)),
+      totalPages: Math.ceil(eventsCount / limit),
+    };
+  } catch (error) {
+    handleError(error);
+  }
+}
+
+// GET RELATED EVENTS: EVENTS WITH SAME CATEGORY
+export async function getRelatedEventsByCategory({
+  categoryId,
+  eventId,
+  limit = 3,
+  page = 1,
+}: GetRelatedEventsByCategoryParams) {
   try {
     await connectToDatabase();
 
     const skipAmount = (Number(page) - 1) * limit;
-    const conditions = { buyer: userId };
+    const conditions = {
+      $and: [{ category: categoryId }, { _id: { $ne: eventId } }],
+    };
 
-    const orders = await Order.distinct("event._id")
-      .find(conditions)
+    const eventsQuery = Event.find(conditions)
       .sort({ createdAt: "desc" })
       .skip(skipAmount)
-      .limit(limit)
-      .populate({
-        path: "event",
-        model: Event,
-        populate: {
-          path: "organizer",
-          model: User,
-          select: "_id firstName lastName",
-        },
-      });
+      .limit(limit);
 
-    const ordersCount = await Order.distinct("event._id").countDocuments(
-      conditions
-    );
+    const events = await populateEvent(eventsQuery);
+    const eventsCount = await Event.countDocuments(conditions);
 
     return {
-      data: JSON.parse(JSON.stringify(orders)),
-      totalPages: Math.ceil(ordersCount / limit),
+      data: JSON.parse(JSON.stringify(events)),
+      totalPages: Math.ceil(eventsCount / limit),
     };
   } catch (error) {
     handleError(error);
